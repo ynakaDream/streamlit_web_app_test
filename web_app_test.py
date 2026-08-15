@@ -43,7 +43,7 @@ with col2:
 
     available_y_columns = [col for col in numeric_col if col not in x_columns]
 
-    y_columns = st.multiselect("目的変数 Y", options=available_y_columns)
+    y_columns = st.selectbox("目的変数 Y", options=available_y_columns)
 
 if len(x_columns) == 0:
     st.info("入力変数を1つ以上選択してください")
@@ -53,24 +53,20 @@ if len(y_columns) == 0:
     st.info("目的変数を1つ以上選択してください")
     st.stop()
 
-x_train = torch.tensor(df[x_columns].to_numpy(), dtype=torch.float32)
-y_train = torch.tensor(df[y_columns].to_numpy(), dtype=torch.float32).squeeze(-1)
+train = df[ df["Usage"] == "Train" ]
+x_train = torch.tensor(train[x_columns].to_numpy(), dtype=torch.float32)
+y_train = torch.tensor(train[y_columns].to_numpy(), dtype=torch.float32).squeeze(-1)
 
-new_x = torch.tensor(
-    [
-        [20, 20, 40],
-        [21, 14, 39],
-        [9, 51, 27],
-        [12, 35, 25]
-    ],
-    dtype=torch.float32)
+validation = df[ df["Usage"] == "Validation" ]
+x_validation = torch.tensor(validation[x_columns].to_numpy(), dtype=torch.float32)
+y_validation = torch.tensor(validation[y_columns].to_numpy(), dtype=torch.float32).squeeze(-1)
 
-x_mean, x_std = x_train.mean(dim=0), x_train.std(dim=0)
-x_train_norm = (x_train - x_mean) / x_std
-new_x_norm = (new_x - x_mean) / x_std
+# x_mean, x_std = x_train.mean(dim=0), x_train.std(dim=0)
+# x_train_norm = (x_train - x_mean) / x_std
+# new_x_norm = (new_x - x_mean) / x_std
 
-y_mean, y_std = y_train.mean(), y_train.std()
-y_train_norm = (y_train - y_mean) / y_std
+# y_mean, y_std = y_train.mean(), y_train.std()
+# y_train_norm = (y_train - y_mean) / y_std
 
 class ExactGPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood):
@@ -85,7 +81,7 @@ class ExactGPModel(gpytorch.models.ExactGP):
 
 
 likelihood = gpytorch.likelihoods.GaussianLikelihood()
-model = ExactGPModel(x_train_norm, y_train, likelihood)
+model = ExactGPModel(x_train, y_train, likelihood)
 
 model.train()
 likelihood.train()
@@ -97,13 +93,13 @@ mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 if st.button("実行", type="primary"):
 
     progress_bar = st.progress(0, text="Now training...")
-    for i in range(1000):
+    for i in range(100):
         optimizer.zero_grad()
-        output = model(x_train_norm)
+        output = model(x_train)
         loss = -mll(output, y_train)
         loss.backward()
         optimizer.step()
-        progress_bar.progress((i + 1)/1000, text="Now Training...")
+        progress_bar.progress((i + 1)/100, text="Now Training...")
         # if (i + 1) % 100 == 0:
         #     length_scale = (model.covar_module.base_kernel.lengthscale.detach().numpy())
         #     noise = (likelihood.noise.item())
@@ -116,19 +112,42 @@ if st.button("実行", type="primary"):
     model.eval()
     likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        prediction = likelihood(model(new_x_norm))
-        mean = prediction.mean
+        prediction = likelihood(model(x_validation))
+        y_pred = prediction.mean
         lower, upper = prediction.confidence_region()
 
-    st.write("予測値")
-    st.write(mean)
-    st.write(lower)
-    st.write(upper)
+    st.subheader("予測結果")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        data_list = torch.stack([y_pred, y_validation], dim=1)
+        result_data = pd.DataFrame(data_list, columns=["Predicted value", "Measured value"])
+        st.table(result_data)
 
-    fig, ax = plt.subplots(figsize=(14, 7))
-    ax.scatter(x_train[:, 0], y_train, color="b", label="train")
-    ax.plot(new_x[:,0], mean, color="r", label="predict")
-    ax.fill_between(new_x[:,0], lower, upper, color="g", alpha=0.5)
-    ax.legend()
+    st.subheader("モデル性能")
 
-    st.pyplot(fig, use_container_width=False)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        fig, ax = plt.subplots(figsize=(5, 3))
+        ax.scatter(y_validation, y_pred)
+        # ax.plot(x_validation[:,0], mean, color="r", label="predict")
+        # ax.fill_between(x_validation[:,0], lower, upper, color="g", alpha=0.5)
+        ax.set_title("Accuracy")
+        ax.set_xlabel("Measured value")
+        ax.set_ylabel("Predicted value")
+        ax.legend()
+        st.pyplot(fig, use_container_width=False)
+
+    with col2:
+        rmse = torch.sqrt(torch.mean((y_validation - y_pred) ** 2))
+        st.write(f"RMSE: {rmse.item():.4f}")
+
+        mae = torch.mean(torch.abs(y_validation - y_pred))
+        st.write(f"MAE: {mae.item():.4f}")
+
+        ss_res = torch.sum((y_validation - y_pred) ** 2)
+        ss_tot = torch.sum((y_validation - torch.mean(y_validation)) ** 2)
+        r2 = 1 - (ss_res / ss_tot)
+        st.write(f"R2: {r2:.4f}")
+
+
+
