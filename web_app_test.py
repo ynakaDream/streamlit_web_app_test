@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+import gpytorch
+from matplotlib import pyplot as plt
 
 st.set_page_config(
     page_title="ガウス過程回帰によるシミュレーション",
@@ -11,41 +13,122 @@ st.title("ガウス過程回帰によるシミュレーション")
 
 file = st.file_uploader("ファイルをアップロードしてください", type=["xlsx"])
 
-if file is not None:
-    st.write(f"{file.name} をアップロードしました！")
+if file is None:
+    # st.write(f"{file.name} をアップロードしました！")
+    st.info("Excelファイルをアップロードしてください！")
+    st.stop()
 
-    excel_file = pd.ExcelFile(file)
+excel_file = pd.ExcelFile(file)
 
-    sheet_name = st.selectbox(
-        "使用するシートを選択してください",
-        excel_file.sheet_names,
-    )
-    df = pd.read_excel(excel_file, sheet_name=sheet_name)
+sheet_name = st.selectbox(
+    "使用するシートを選択してください",
+    excel_file.sheet_names,
+)
+df = pd.read_excel(excel_file, sheet_name=sheet_name)
 
-    st.subheader("読み込んだデータ")
-    st.dataframe(df, use_container_width=True)
+st.subheader("読み込んだデータ")
+st.dataframe(df, use_container_width=True)
 
-    numeric_col = (df.select_dtypes(include=np.number).columns.tolist())
+numeric_col = (df.select_dtypes(include=np.number).columns.tolist())
 
-    st.header("入力変数・目的変数")
+st.header("入力変数・目的変数")
 
-    col1, col2 = st.columns(2)
+col1, col2 = st.columns(2)
 
-    with col1:
+with col1:
 
-        x_columns = st.multiselect("入力変数 X", options=numeric_col)
+    x_columns = st.multiselect("入力変数 X", options=numeric_col)
 
-    with col2:
+with col2:
 
-        available_y_columns = [col for col in numeric_col if col not in x_columns]
+    available_y_columns = [col for col in numeric_col if col not in x_columns]
 
-        y_columns = st.multiselect("目的変数 Y", options=available_y_columns)
+    y_columns = st.multiselect("目的変数 Y", options=available_y_columns)
 
-    if len(x_columns) == 0:
-        st.info("入力変数を1つ以上選択してください")
-        st.stop()
+if len(x_columns) == 0:
+    st.info("入力変数を1つ以上選択してください")
+    st.stop()
 
-    if len(y_columns) == 0:
-        st.info("目的変数を1つ以上選択してください")
-        st.stop()
+if len(y_columns) == 0:
+    st.info("目的変数を1つ以上選択してください")
+    st.stop()
 
+x_train = torch.tensor(df[x_columns].to_numpy(), dtype=torch.float32)
+y_train = torch.tensor(df[y_columns].to_numpy(), dtype=torch.float32).squeeze(-1)
+
+new_x = torch.tensor(
+    [
+        [20, 20, 40],
+        [21, 14, 39],
+        [9, 51, 27],
+        [12, 35, 25]
+    ],
+    dtype=torch.float32)
+
+x_mean, x_std = x_train.mean(dim=0), x_train.std(dim=0)
+x_train_norm = (x_train - x_mean) / x_std
+new_x_norm = (new_x - x_mean) / x_std
+
+y_mean, y_std = y_train.mean(), y_train.std()
+y_train_norm = (y_train - y_mean) / y_std
+
+class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super().__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=x_train.shape[1]))
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+likelihood = gpytorch.likelihoods.GaussianLikelihood()
+model = ExactGPModel(x_train_norm, y_train, likelihood)
+
+model.train()
+likelihood.train()
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+
+mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+if st.button("実行", type="primary"):
+
+    progress_bar = st.progress(0, text="Now training...")
+    for i in range(1000):
+        optimizer.zero_grad()
+        output = model(x_train_norm)
+        loss = -mll(output, y_train)
+        loss.backward()
+        optimizer.step()
+        progress_bar.progress((i + 1)/1000, text="Now Training...")
+        # if (i + 1) % 100 == 0:
+        #     length_scale = (model.covar_module.base_kernel.lengthscale.detach().numpy())
+        #     noise = (likelihood.noise.item())
+        #     st.write(length_scale)
+        #     st.write(noise)
+        #     st.write(f"loss: {loss.item():.4f}")
+
+    progress_bar.empty()
+
+    model.eval()
+    likelihood.eval()
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        prediction = likelihood(model(new_x_norm))
+        mean = prediction.mean
+        lower, upper = prediction.confidence_region()
+
+    st.write("予測値")
+    st.write(mean)
+    st.write(lower)
+    st.write(upper)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.scatter(x_train[:, 0], y_train, color="b", label="train")
+    ax.plot(new_x[:,0], mean, color="r", label="predict")
+    ax.fill_between(new_x[:,0], lower, upper, color="g", alpha=0.5)
+    ax.legend()
+
+    st.pyplot(fig, use_container_width=False)
